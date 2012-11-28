@@ -19,7 +19,7 @@ public class RedisRiverPlugin extends AbstractPlugin {
 
     @Override
     public String description() {
-        return "River Redis Plugin";
+    	return "River Redis Plugin";
     }
 
     public void onModule(RiversModule module) {
