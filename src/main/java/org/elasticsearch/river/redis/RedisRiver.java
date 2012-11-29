@@ -29,7 +29,7 @@ public class RedisRiver extends AbstractRiverComponent implements River {
 	private final int     redisDB;
 	
 	private final int bulkSize;
-    private final TimeValue bulkTimeout;
+    private final long bulkTimeout;
 
     private volatile boolean closed = false;
 
@@ -57,18 +57,22 @@ public class RedisRiver extends AbstractRiverComponent implements River {
 			redisDB   = 0;
 		}
 		
+		TimeValue bulkTimeoutValue = null;
+		
 		if (settings.settings().containsKey("index")) {
             Map<String, Object> indexSettings = (Map<String, Object>) settings.settings().get("index");
             bulkSize = XContentMapValues.nodeIntegerValue(indexSettings.get("bulk_size"), 100);
             if (indexSettings.containsKey("bulk_timeout")) {
-                bulkTimeout = TimeValue.parseTimeValue(XContentMapValues.nodeStringValue(indexSettings.get("bulk_timeout"), "10s"), TimeValue.timeValueSeconds(10));
+            	bulkTimeoutValue = TimeValue.parseTimeValue(XContentMapValues.nodeStringValue(indexSettings.get("bulk_timeout"), "10s"), TimeValue.timeValueSeconds(10));
             } else {
-                bulkTimeout = TimeValue.timeValueSeconds(10);
+            	bulkTimeoutValue = TimeValue.timeValueSeconds(10);
             }
         } else {
             bulkSize = 100;
-            bulkTimeout = TimeValue.timeValueSeconds(10);
+            bulkTimeoutValue = TimeValue.timeValueSeconds(10);
         }
+		
+		bulkTimeout = bulkTimeoutValue.millis();
 	}
 
 	@Override
@@ -138,7 +142,7 @@ public class RedisRiver extends AbstractRiverComponent implements River {
                     }
                     List<String> response = null;
                     try {
-                    	response = jedis.blpop((int)bulkTimeout.getSeconds(), redisKey);
+                    	response = jedis.blpop(60, redisKey);
                     } catch (Exception e) {
                         if (!closed) {
                             logger.error("failed to pop message, reconnecting...", e);
@@ -148,6 +152,8 @@ public class RedisRiver extends AbstractRiverComponent implements River {
                     }
                     
                     if (response != null) {
+                    	
+                    	long bulkStartMillis = System.currentTimeMillis();
                     	
                     	BulkRequestBuilder bulkRequestBuilder = client.prepareBulk();
                     	
@@ -159,23 +165,87 @@ public class RedisRiver extends AbstractRiverComponent implements River {
                             continue;
                         }
                         
+                        List<String> items = null;
                         try {
-                        	List<String> items = jedis.lrange(redisKey, 0, bulkSize - 2);
-                        	if (items != null) {
-                        		for (String item : items) {
-                        			try {
-                        				byte[] data = item.getBytes();
-                        				bulkRequestBuilder.add(data, 0, data.length, false);
-                        			} catch (Exception e) {
-                        				logger.warn("failed to add item to bulk [{}]", e);
+                        	items = jedis.lrange(redisKey, 0, bulkSize - bulkRequestBuilder.numberOfActions() - 1);
+                        } catch (Exception e) {
+                        	if (!closed) {
+                                logger.error("failed to lrange items ...", e);
+                            }
+                        	bulkRequestBuilder.execute();
+                            cleanup(0, "failed to get message");
+                            break;
+						}
+                        
+                        if (items != null) {
+                        	if (items.size() > 0) {
+                        		try {
+                        			// First trim the list so that we do not index duplicates
+                        			jedis.ltrim(redisKey, items.size(), -1);
+                        			for (String item : items) {
+                        				try {
+                        					byte[] data = item.getBytes();
+                        					bulkRequestBuilder.add(data, 0, data.length, false);
+                        				} catch (Exception e) {
+                        					logger.warn("failed to add item to bulk [{}]", e);
+                        				}
                         			}
+                        		} catch (Exception e) {
+                        			if (!closed) {
+                                        logger.error("failed to ltrim list ...", e);
+                                    }
+                                	bulkRequestBuilder.execute();
+                                    cleanup(0, "failed to ltrim list");
+                                    break;
                         		}
                         	}
-                        } catch (Exception e) {
-                        	if (closed) {
-                        		break;
+                    	}
+                        
+                        items = null;
+                        
+                        if (bulkRequestBuilder.numberOfActions() < bulkSize) {
+                    		try {
+                    			Thread.sleep(bulkStartMillis + bulkTimeout - System.currentTimeMillis());
+                            } catch (InterruptedException e1) {
+                                // ignore, if we are closing, we will exit later
+                            }
+                            
+                            try {
+                            	items = jedis.lrange(redisKey, 0, bulkSize - bulkRequestBuilder.numberOfActions() - 1);
+                            } catch (Exception e) {
+                            	if (!closed) {
+                                    logger.error("failed to lrange list ...", e);
+                                }
+                            	bulkRequestBuilder.execute();
+                                cleanup(0, "failed to lrange list");
+                                break;
+    						}
+                            
+                            if (items != null) {
+                            	if (items.size() > 0) {
+                            		try {
+                            			// First trim the list so that we do not index duplicates
+                            			jedis.ltrim(redisKey, items.size(), -1);
+                            			for (String item : items) {
+                            				try {
+                            					byte[] data = item.getBytes();
+                            					bulkRequestBuilder.add(data, 0, data.length, false);
+                            				} catch (Exception e) {
+                            					logger.warn("failed to add item to bulk [{}]", e);
+                            				}
+                            			}
+                            		} catch (Exception e) {
+                            			if (!closed) {
+                                            logger.error("failed to ltrim items ...", e);
+                                        }
+                                    	bulkRequestBuilder.execute();
+                                        cleanup(0, "failed to ltrim list");
+                                        break;
+                            		}
+                            	}
                         	}
-                        }
+                            
+                    	}
                         
                         bulkRequestBuilder.execute(new ActionListener<BulkResponse>() {
                             @Override
