@@ -159,26 +159,22 @@ public class RedisRiver extends AbstractRiverComponent implements River {
                             continue;
                         }
                         
-                        String item = null;
-                        
-                        if (bulkRequestBuilder.numberOfActions() < bulkSize) {
-                        	try {
-                        		while ((item = jedis.lpop(redisKey)) != null) {
-                                    try {
-                                    	byte[] data = item.getBytes();
-                                    	 bulkRequestBuilder.add(data, 0, data.length, false);
-                                    } catch (Exception e) {
-                                    	logger.warn("failed to add item to bulk [{}]", e);
-                                    }
-                                    if (bulkRequestBuilder.numberOfActions() >= bulkSize) {
-                                        break;
-                                    }
-                                }
-                        	} catch (Exception e) {
-                                if (closed) {
-                                    break;
-                                }
-                            }
+                        try {
+                        	List<String> items = jedis.lrange(redisKey, 0, bulkSize - 2);
+                        	if (items != null) {
+                        		for (String item : items) {
+                        			try {
+                        				byte[] data = item.getBytes();
+                        				bulkRequestBuilder.add(data, 0, data.length, false);
+                        			} catch (Exception e) {
+                        				logger.warn("failed to add item to bulk [{}]", e);
+                        			}
+                        		}
+                        	}
+                        } catch (Exception e) {
+                        	if (closed) {
+                        		break;
+                        	}
                         }
                         
                         bulkRequestBuilder.execute(new ActionListener<BulkResponse>() {
